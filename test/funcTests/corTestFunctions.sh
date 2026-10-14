@@ -10,7 +10,7 @@
 #                 `. <dir>/install/env` after coraine-build)
 #   IOTAJSON_PORT     its port (default 19026 - clear of a broker on 1026 and of coraine's own test ports)
 #   IOTAJSON_PLUGIN   the plugin under test (default: iotajson.so in this repo)
-#   IOTAJSON_TEST_DIR scratch directory: the bridge configuration, the device files, the broker's pid and log
+#   IOTAJSON_TEST_DIR scratch directory: the bridge configuration, the devices' logs, the broker's pid and log
 #
 IOTAJSON_BROKER="${IOTAJSON_BROKER:-coraine}"
 IOTAJSON_PORT="${IOTAJSON_PORT:-19026}"
@@ -65,88 +65,4 @@ brokerStop() {
   done
   kill -9 "$pid" 2>/dev/null
   rm -f "$pidFile"
-}
-
-
-# -----------------------------------------------------------------------------
-#
-# deviceWrite <endpoint> <content> [time] - the device produces a value: its file, written whole
-#
-# Written beside it and renamed, so the bridge never reads half a value. [time] (ISO 8601) sets the
-# file's modification time, which the bridge reports as the value's time - observedAt.
-#
-deviceWrite() {
-  local file="$IOTAJSON_TEST_DIR/device/$1"
-
-  mkdir -p "$(dirname "$file")"
-  echo "$2" > "$file.new"
-  [ -z "$3" ] || touch -d "$3" "$file.new"
-  mv "$file.new" "$file"
-}
-
-
-# -----------------------------------------------------------------------------
-#
-# deviceAwait <endpoint> <content> [seconds] - wait until the device's file holds <content>, then print it
-#
-deviceAwait() {
-  local file="$IOTAJSON_TEST_DIR/device/$1" secs="${3:-10}" i
-
-  for ((i = 0; i < secs * 10; i++)); do
-    [ "$(cat "$file" 2>/dev/null)" == "$2" ] && { cat "$file"; return 0; }
-    sleep 0.1
-  done
-
-  echo "deviceAwait: '$1' holds '$(cat "$file" 2>/dev/null)', not '$2', after ${secs}s" >&2
-  cat "$file" 2>/dev/null
-  return 1
-}
-
-
-# -----------------------------------------------------------------------------
-#
-# entityAwait <entityId> <attr> <text> [seconds] - wait until GET the attribute (keyValues) contains <text>
-#
-entityAwait() {
-  local url="localhost:$IOTAJSON_PORT/ngsi-ld/v1/entities/$1?options=keyValues&attrs=$2" secs="${4:-10}" i
-
-  for ((i = 0; i < secs * 10; i++)); do
-    curl -s "$url" | grep -qF -- "$3" && return 0
-    sleep 0.1
-  done
-
-  echo "entityAwait: $1/$2 is $(curl -s "$url"), without '$3', after ${secs}s" >&2
-  return 1
-}
-
-
-# -----------------------------------------------------------------------------
-#
-# entityGet <entityId> <attrs> [options] - the entity's attributes, JSON with sorted members
-#
-entityGet() {
-  curl -s "localhost:$IOTAJSON_PORT/ngsi-ld/v1/entities/$1?attrs=$2${3:+&options=$3}" \
-    | python3 -c 'import sys, json; print(json.dumps(json.load(sys.stdin), indent=2, sort_keys=True))'
-}
-
-
-# -----------------------------------------------------------------------------
-#
-# attrPatch <entityId> <attr> <body> - PATCH one attribute; prints the HTTP status
-#
-attrPatch() {
-  curl -s -o /dev/null -w "%{http_code}\n" -X PATCH "localhost:$IOTAJSON_PORT/ngsi-ld/v1/entities/$1/attrs/$2" \
-       -H 'Content-Type: application/json' -d "$3"
-}
-
-
-# -----------------------------------------------------------------------------
-#
-# channels - one line per Channel: endpoint, status, counters - and why, when it is dormant
-#
-channels() {
-  curl -s "localhost:$IOTAJSON_PORT/ngsi-ld/v1/channels" | python3 -c 'import sys, json
-for c in sorted(json.load(sys.stdin), key=lambda c: c["channelTarget"]):
-  line = "%s %s samplesIn=%s samplesOut=%s" % (c["channelTarget"], c["status"], c.get("samplesIn"), c.get("samplesOut"))
-  print(line if c["status"] == "available" else "%s - %s" % (line, c.get("statusReason")))'
 }

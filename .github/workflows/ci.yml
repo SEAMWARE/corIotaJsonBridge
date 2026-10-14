@@ -18,16 +18,19 @@ jobs:
     runs-on: ubuntu-latest
 
     #
-    # Pinned, as in coraine's ci.yml: a red run is then a change in this repo, not in the image.
-    # TODO: move the tag with coraine's.
+    # Pinned, as in coraine's ci.yml (the same tag): a red run is then a change in this repo, not in the
+    # image. It has mosquitto, libmosquitto-dev and libmicrohttpd; not paho, which device.py needs.
     #
     container:
-      image: quay.io/seamware/coraine-ci:2026-09-22-f5a4eb4
+      image: quay.io/seamware/coraine-ci:2026-10-13-f4804c2
 
     env:
       SEAMWARE_PLUGIN_DIR: /opt/seamware/plugins
 
     steps:
+      - name: The test devices' MQTT client
+        run: apt-get update -qq && apt-get install -y -qq python3-paho-mqtt
+
       - name: Check out this bridge
         uses: actions/checkout@v4
         with:
