@@ -78,11 +78,12 @@ static char* configLoad(const char* path)
 
 // -----------------------------------------------------------------------------
 //
-// iotajsonInit - the MQTT connection, from the --bridgeConfig file's member of this bridge:
+// iotajsonInit - the MQTT connection and the southbound port, from the --bridgeConfig file's member of
+// this bridge:
 //
-//   { "iotajson": { "server": { "uri": "mqtt://mosquitto:1883" } } }
+//   { "iotajson": { "server": { "uri": "mqtt://mosquitto:1883" }, "southbound": { "port": 7896 } } }
 //
-// No "server": HTTP commands only.
+// No "server": no MQTT commands. No "southbound": no pull commands.
 //
 static int iotajsonInit(const char* configFile, const BridgeBroker* brokerP)
 {
@@ -90,6 +91,7 @@ static int iotajsonInit(const char* configFile, const BridgeBroker* brokerP)
   CorJson   cj;
   char      buf[16 * 1024];
   CorNode*  serverP = NULL;
+  CorNode*  southP  = NULL;
   char*     text    = (configFile != NULL) ? configLoad(configFile) : NULL;
 
   corAllocBufferInit(&ka, buf, sizeof(buf), 16 * 1024, NULL, "iotajson config");
@@ -100,10 +102,11 @@ static int iotajsonInit(const char* configFile, const BridgeBroker* brokerP)
     CorNode* rootP   = corJsonParse(&cj, text);       // valid JSON: the broker has parsed the same file
     CorNode* bridgeP = (rootP != NULL) ? corTreeLookup(rootP, "iotajson") : NULL;
 
-    serverP = (bridgeP != NULL) ? corTreeLookup(bridgeP, "server") : NULL;
+    serverP = (bridgeP != NULL) ? corTreeLookup(bridgeP, "server")     : NULL;
+    southP  = (bridgeP != NULL) ? corTreeLookup(bridgeP, "southbound") : NULL;
   }
 
-  int r = iotajsonExecutorOpen(serverP, brokerP);
+  int r = iotajsonExecutorOpen(serverP, southP, brokerP);
 
   corAllocBufferReset(&ka, false);                    // nothing parsed here is kept
   free(text);                                         // after the tree: its strings point into it
@@ -198,7 +201,7 @@ __attribute__((visibility("default"))) void bridgeRegister(BridgeDriver* driverP
 
   if (driverP->abiVersion >= 11)
   {
-    driverP->serviceSchemes = "iota-json+mqtt,iota-json+http,iota-json+https";
+    driverP->serviceSchemes = "iota-json+mqtt,iota-json+http,iota-json+https,iota-json+poll";
     driverP->serviceExecute = iotajsonServiceExecute;
     driverP->serviceCancel  = iotajsonServiceCancel;
   }

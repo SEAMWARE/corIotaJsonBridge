@@ -19,8 +19,9 @@
 // The IoT Agent JSON's commands, as Service Executions - see header.
 //
 // Threads: serviceExecute runs on a broker thread and never blocks - an MQTT command is published (the
-// publish is queued by libmosquitto), an HTTP command is queued for the HTTP worker. Answers arrive on
-// libmosquitto's thread (cmdexe) and on the worker (the POST's response); both report through
+// publish is queued by libmosquitto), an HTTP command is queued for the HTTP worker, a pull command is
+// stored. Answers arrive on libmosquitto's thread (cmdexe), on the worker (the POST's response) and on the
+// southbound server's thread (a device's getCmd=1 and POST /iot/json/commands); all report through
 // brokerP->serviceUpdateIn - never from inside serviceExecute, on the broker's thread.
 //
 #include <pthread.h>                                  // pthread_*
@@ -49,6 +50,7 @@
 
 #include "corBridge/BridgeBroker.h"                   // BridgeBroker, BRIDGE_*
 
+#include "iotajsonSouth.h"                            // iotajsonSouthOpen, iotajsonSouthClose
 #include "iotajsonExecutor.h"                         // Own interface
 
 
@@ -56,12 +58,14 @@
 #define SCHEME_MQTT   "iota-json+mqtt://"
 #define SCHEME_HTTP   "iota-json+http://"
 #define SCHEME_HTTPS  "iota-json+https://"
+#define SCHEME_POLL   "iota-json+poll://"
 
 
 
 // -----------------------------------------------------------------------------
 //
-// Pending - an MQTT command published, waiting for its cmdexe; oldest first per (apikey, device, cmd)
+// Pending - a command waiting for the device's answer, oldest first per (apikey, device, cmd): an MQTT
+// command published, or a pull command - stored until the device asks (getCmd=1), then delivered
 //
 typedef struct Pending
 {
@@ -69,6 +73,9 @@ typedef struct Pending
   char             apikey[128];
   char             deviceId[256];
   char             cmd[128];
+  bool             pull;                              // iota-json+poll://
+  bool             delivered;                         // a pull command handed to the device
+  char*            payload;                           // a pull command's {"<cmd>": <value>}, malloc'd
   struct Pending*  next;
 } Pending;
 
@@ -101,6 +108,7 @@ static HttpJob*             jobTail      = NULL;
 static bool                 workerStop   = false;
 static bool                 workerUp     = false;
 static pthread_t            worker;
+static bool                 southUp      = false;
 
 
 
@@ -108,15 +116,32 @@ static pthread_t            worker;
 //
 // report - serviceUpdateIn, if the broker has it
 //
-static void report(const char* executionId, const char* status, const char* outputJson, const char* errorJson)
+static void reportProgress(const char* executionId, const char* status, const char* progressJson, const char* outputJson, const char* errorJson)
 {
   if ((brokerP == NULL) || (brokerP->abiVersion < 11) || (brokerP->serviceUpdateIn == NULL))
     return;
 
-  int r = brokerP->serviceUpdateIn("iotajson", executionId, status, NULL, outputJson, errorJson);
+  int r = brokerP->serviceUpdateIn("iotajson", executionId, status, progressJson, outputJson, errorJson);
 
   if ((r != BRIDGE_OK) && (r != BRIDGE_NOT_FOUND))
     COR_W("iotajson: the broker did not take the report on '%s' (%d)", executionId, r);
+}
+
+static void report(const char* executionId, const char* status, const char* outputJson, const char* errorJson)
+{
+  reportProgress(executionId, status, NULL, outputJson, errorJson);
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// pendingFree -
+//
+static void pendingFree(Pending* p)
+{
+  free(p->payload);
+  free(p);
 }
 
 
@@ -276,22 +301,55 @@ static bool queryParam(const char* query, const char* name, char* buf, int size)
 
 // -----------------------------------------------------------------------------
 //
+// deviceParse - <apikey>/<deviceId>/<cmd> after the scheme, into pP; what follows it (NUL or '?'), NULL:
+// not that
+//
+static const char* deviceParse(const char* url, const char* scheme, Pending* pP)
+{
+  const char* s = &url[strlen(scheme)];
+
+  memset(pP, 0, sizeof(Pending));
+
+  if (((s = segment(s, pP->apikey, sizeof(pP->apikey))) == NULL) || (*s++ != '/') ||
+      ((s = segment(s, pP->deviceId, sizeof(pP->deviceId))) == NULL) || (*s++ != '/') ||
+      ((s = segment(s, pP->cmd, sizeof(pP->cmd))) == NULL) || ((*s != 0) && (*s != '?')))
+  {
+    COR_W("iotajson: '%s' - not %s<apikey>/<deviceId>/<command>", url, scheme);
+    return NULL;
+  }
+
+  return s;
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// pendingAppend - the newest of its (apikey, device, cmd)
+//
+static void pendingAppend(Pending* pendingP)
+{
+  pthread_mutex_lock(&pendingMutex);
+  Pending** lastPP = &pendingHead;
+  while (*lastPP != NULL)
+    lastPP = &(*lastPP)->next;
+  *lastPP = pendingP;
+  pthread_mutex_unlock(&pendingMutex);
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
 // mqttExecute - iota-json+mqtt://<apikey>/<deviceId>/<cmd>[?qos=..&retain=..]
 //
 static int mqttExecute(const char* url, const char* executionId, const char* inputJson)
 {
   Pending     p;
-  const char* s = &url[strlen(SCHEME_MQTT)];
+  const char* s = deviceParse(url, SCHEME_MQTT, &p);
 
-  memset(&p, 0, sizeof(p));
-
-  if (((s = segment(s, p.apikey, sizeof(p.apikey))) == NULL) || (*s++ != '/') ||
-      ((s = segment(s, p.deviceId, sizeof(p.deviceId))) == NULL) || (*s++ != '/') ||
-      ((s = segment(s, p.cmd, sizeof(p.cmd))) == NULL) || ((*s != 0) && (*s != '?')))
-  {
-    COR_W("iotajson: '%s' - not iota-json+mqtt://<apikey>/<deviceId>/<command>", url);
+  if (s == NULL)
     return BRIDGE_BAD_INPUT;
-  }
 
   char qosBuf[8]    = "0";
   char retainBuf[8] = "false";
@@ -330,13 +388,7 @@ static int mqttExecute(const char* url, const char* executionId, const char* inp
   }
 
   *pendingP = p;
-
-  pthread_mutex_lock(&pendingMutex);
-  Pending** lastPP = &pendingHead;
-  while (*lastPP != NULL)
-    lastPP = &(*lastPP)->next;
-  *lastPP = pendingP;
-  pthread_mutex_unlock(&pendingMutex);
+  pendingAppend(pendingP);
 
   int rc = mosquitto_publish(mosq, NULL, topic, strlen(payload), payload, atoi(qosBuf), strcmp(retainBuf, "true") == 0);
 
@@ -354,7 +406,7 @@ static int mqttExecute(const char* url, const char* executionId, const char* inp
       }
     }
     pthread_mutex_unlock(&pendingMutex);
-    free(pendingP);
+    pendingFree(pendingP);
 
     COR_W("iotajson: command '%s' to %s: %s", p.cmd, topic, mosquitto_strerror(rc));
     return BRIDGE_ERR;
@@ -365,6 +417,48 @@ static int mqttExecute(const char* url, const char* executionId, const char* inp
   // the execution as executing already; the outcome comes on libmosquitto's thread (cmdexe)
   //
   COR_V("iotajson: execution '%s': published on %s", executionId, topic);
+  return BRIDGE_OK;
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// pollExecute - iota-json+poll://<apikey>/<deviceId>/<cmd> - stored until the device asks for its commands
+// (getCmd=1 on the southbound port)
+//
+static int pollExecute(const char* url, const char* executionId, const char* inputJson)
+{
+  Pending p;
+
+  if (deviceParse(url, SCHEME_POLL, &p) == NULL)
+    return BRIDGE_BAD_INPUT;
+
+  if (southUp == false)
+  {
+    COR_W("iotajson: '%s' - no southbound port configured (\"southbound\": { \"port\": ... }): a device cannot ask for it", url);
+    return BRIDGE_ERR;
+  }
+
+  Pending* pendingP = malloc(sizeof(Pending));
+
+  if (pendingP == NULL)
+    return BRIDGE_ERR;
+
+  *pendingP = p;
+  pendingP->pull    = true;
+  pendingP->payload = commandPayload(p.cmd, inputJson);
+  snprintf(pendingP->executionId, sizeof(pendingP->executionId), "%s", executionId);
+
+  if (pendingP->payload == NULL)
+  {
+    free(pendingP);
+    return BRIDGE_BAD_INPUT;
+  }
+
+  pendingAppend(pendingP);
+
+  COR_V("iotajson: execution '%s': stored for %s/%s", executionId, p.apikey, p.deviceId);
   return BRIDGE_OK;
 }
 
@@ -628,11 +722,121 @@ static void cmdexe(const char* apikey, const char* deviceId, const char* payload
 
     report(foundP->executionId, "completed", output, NULL);
     free(output);
-    free(foundP);
+    pendingFree(foundP);
   }
 
   corAllocBufferReset(&ka, false);
   free(copy);
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// iotajsonCommandResult - a device's POST /iot/json/commands: as a cmdexe
+//
+void iotajsonCommandResult(const char* apikey, const char* deviceId, const char* body, int len)
+{
+  cmdexe(apikey, deviceId, body, len);
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// iotajsonPullDeliver - the device's pull commands not yet delivered, in one object, as iotagent-json
+// hands them over: {"<cmd>": <value>, ...} - a command stored twice, its later value; "{}": none. Each is
+// delivered from here on: its execution still executing, its progress { "delivered": true }. malloc'd.
+//
+char* iotajsonPullDeliver(const char* apikey, const char* deviceId)
+{
+  Pending** deliveredV = NULL;
+  int       delivered  = 0;
+  int       size       = 3;
+
+  pthread_mutex_lock(&pendingMutex);
+
+  for (Pending* p = pendingHead; p != NULL; p = p->next)
+  {
+    if ((p->pull == true) && (p->delivered == false) && (strcmp(p->apikey, apikey) == 0) && (strcmp(p->deviceId, deviceId) == 0))
+      delivered++;
+  }
+
+  if ((delivered > 0) && ((deliveredV = malloc(delivered * sizeof(Pending*))) == NULL))
+  {
+    pthread_mutex_unlock(&pendingMutex);
+    return NULL;
+  }
+
+  delivered = 0;
+  for (Pending* p = pendingHead; p != NULL; p = p->next)
+  {
+    if ((p->pull == true) && (p->delivered == false) && (strcmp(p->apikey, apikey) == 0) && (strcmp(p->deviceId, deviceId) == 0))
+    {
+      deliveredV[delivered++] = p;
+      size += strlen(p->payload) + 1;
+    }
+  }
+
+  //
+  // {"a":1} {"b":2} -> {"a":1,"b":2}: each payload is an object of one member, rendered here (commandPayload)
+  //
+  char* out = malloc(size);
+  int   at  = 0;
+
+  if (out != NULL)
+  {
+    out[at++] = '{';
+
+    for (int ix = 0; ix < delivered; ix++)
+    {
+      bool later = false;
+
+      for (int jx = ix + 1; jx < delivered; jx++)
+      {
+        if (strcmp(deliveredV[jx]->cmd, deliveredV[ix]->cmd) == 0)
+          later = true;
+      }
+
+      if (later == false)
+      {
+        int len = strlen(deliveredV[ix]->payload);
+
+        if (at > 1)
+          out[at++] = ',';
+        memcpy(&out[at], &deliveredV[ix]->payload[1], len - 2);
+        at += len - 2;
+      }
+    }
+
+    out[at++] = '}';
+    out[at]   = 0;
+  }
+
+  //
+  // Delivered - and reported so after the lock: the ids copied, as the answer may end an execution meanwhile
+  //
+  char (*idV)[128] = (delivered > 0) ? malloc(delivered * 128) : NULL;
+
+  for (int ix = 0; ix < delivered; ix++)
+  {
+    if (out != NULL)
+      deliveredV[ix]->delivered = true;
+    if (idV != NULL)
+      snprintf(idV[ix], 128, "%s", deliveredV[ix]->executionId);
+  }
+
+  pthread_mutex_unlock(&pendingMutex);
+
+  if ((out != NULL) && (idV != NULL))
+  {
+    for (int ix = 0; ix < delivered; ix++)
+      reportProgress(idV[ix], "executing", "{\"delivered\":true}", NULL, NULL);
+  }
+
+  free(idV);
+  free(deliveredV);
+  return out;
 }
 
 
@@ -779,14 +983,28 @@ static int mqttOpen(const char* uri)
 //
 // iotajsonExecutorOpen -
 //
-int iotajsonExecutorOpen(CorNode* serverP, const BridgeBroker* _brokerP)
+int iotajsonExecutorOpen(CorNode* serverP, CorNode* southP, const BridgeBroker* _brokerP)
 {
   brokerP = _brokerP;
 
-  CorNode* uriP = (serverP != NULL) ? corTreeLookup(serverP, "uri") : NULL;
+  CorNode* uriP  = (serverP != NULL) ? corTreeLookup(serverP, "uri")  : NULL;
+  CorNode* portP = (southP  != NULL) ? corTreeLookup(southP,  "port") : NULL;
 
   if ((uriP != NULL) && (uriP->type == CorString) && (mqttOpen(uriP->value.s) != BRIDGE_OK))
     return BRIDGE_ERR;
+
+  if (portP != NULL)
+  {
+    if ((portP->type != CorInt) || (portP->value.i <= 0) || (portP->value.i > 65535))
+    {
+      COR_E("iotajson: southbound.port - a TCP port, 1-65535");
+      return BRIDGE_ERR;
+    }
+
+    if (iotajsonSouthOpen((unsigned short) portP->value.i) != BRIDGE_OK)
+      return BRIDGE_ERR;
+    southUp = true;
+  }
 
   workerStop = false;
   if (pthread_create(&worker, NULL, httpWorker, NULL) != 0)
@@ -807,6 +1025,12 @@ int iotajsonExecutorOpen(CorNode* serverP, const BridgeBroker* _brokerP)
 //
 void iotajsonExecutorClose(void)
 {
+  if (southUp == true)
+  {
+    iotajsonSouthClose();                             // no request in flight after it
+    southUp = false;
+  }
+
   if (workerUp == true)
   {
     pthread_mutex_lock(&jobMutex);
@@ -831,7 +1055,7 @@ void iotajsonExecutorClose(void)
   {
     Pending* p = pendingHead;
     pendingHead = p->next;
-    free(p);
+    pendingFree(p);
   }
   pthread_mutex_unlock(&pendingMutex);
 
@@ -849,6 +1073,9 @@ int iotajsonServiceExecute(const char* url, const char* executionId, const char*
   if (strncmp(url, SCHEME_MQTT, strlen(SCHEME_MQTT)) == 0)
     return mqttExecute(url, executionId, inputJson);
 
+  if (strncmp(url, SCHEME_POLL, strlen(SCHEME_POLL)) == 0)
+    return pollExecute(url, executionId, inputJson);
+
   if ((strncmp(url, SCHEME_HTTP, strlen(SCHEME_HTTP)) == 0) || (strncmp(url, SCHEME_HTTPS, strlen(SCHEME_HTTPS)) == 0))
     return httpExecute(url, executionId, inputJson);
 
@@ -859,23 +1086,40 @@ int iotajsonServiceExecute(const char* url, const char* executionId, const char*
 
 // -----------------------------------------------------------------------------
 //
-// iotajsonServiceCancel - BridgeDriver.serviceCancel: a command handed to a device cannot be taken back
+// iotajsonServiceCancel - BridgeDriver.serviceCancel: a pull command the device has not asked for yet is
+// withdrawn; a command handed to a device cannot be taken back
 //
 int iotajsonServiceCancel(const char* url, const char* executionId)
 {
   (void) url;
 
-  bool found = false;
+  Pending* foundP    = NULL;
+  bool     withdrawn = false;
 
   pthread_mutex_lock(&pendingMutex);
-  for (Pending* p = pendingHead; p != NULL; p = p->next)
+  for (Pending** pp = &pendingHead; *pp != NULL; pp = &(*pp)->next)
   {
-    if (strcmp(p->executionId, executionId) == 0)
-      found = true;
+    if (strcmp((*pp)->executionId, executionId) == 0)
+    {
+      foundP = *pp;
+
+      if ((foundP->pull == true) && (foundP->delivered == false))
+      {
+        *pp       = foundP->next;
+        withdrawn = true;
+      }
+      break;
+    }
   }
   pthread_mutex_unlock(&pendingMutex);
 
-  return (found == true) ? BRIDGE_UNSUPPORTED : BRIDGE_NOT_FOUND;
+  if (withdrawn == true)
+  {
+    pendingFree(foundP);
+    return BRIDGE_OK;
+  }
+
+  return (foundP != NULL) ? BRIDGE_UNSUPPORTED : BRIDGE_NOT_FOUND;
 }
 
 
