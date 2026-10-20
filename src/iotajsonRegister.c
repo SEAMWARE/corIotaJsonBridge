@@ -21,7 +21,11 @@
 //
 // The IoT Agent JSON as a Service Executor (coraine doc/iot-agent-executor.md): a Service Registration
 // whose endpoint is iota-json+mqtt:// or iota-json+http[s]:// is executed here - the device's command.
-// Measures (Channels) are not built yet: a Channel is refused. The executor is in iotajsonExecutor.c.
+// The executor is in iotajsonExecutor.c.
+//
+// Its measures are DataChannel records (coraine doc/iot-agent-measures.md): a DataChannel's endpoint is
+// <apikey> (a group) or <apikey>/<deviceId> (a device); iotajsonMeasures.c hands each measure over. A Channel
+// or an AssetChannel is refused - this bridge carries DataChannels only.
 //
 #include <stdbool.h>                                  // bool
 #include <stdio.h>                                    // fopen, fread, fseek, ftell
@@ -43,6 +47,11 @@
 #include "corBridge/BridgeBroker.h"                   // BridgeBroker, BRIDGE_*
 
 #include "iotajsonExecutor.h"                        // iotajsonExecutor*, iotajsonService*
+#include "iotajsonMeasures.h"                         // iotajsonMeasures*, iotajsonMeasureEndpoint*
+
+
+
+static const BridgeBroker* hostP = NULL;
 
 
 
@@ -106,6 +115,9 @@ static int iotajsonInit(const char* configFile, const BridgeBroker* brokerP)
     southP  = (bridgeP != NULL) ? corTreeLookup(bridgeP, "southbound") : NULL;
   }
 
+  hostP = brokerP;
+  iotajsonMeasuresOpen(brokerP);
+
   int r = iotajsonExecutorOpen(serverP, southP, brokerP);
 
   corAllocBufferReset(&ka, false);                    // nothing parsed here is kept
@@ -121,24 +133,52 @@ static int iotajsonInit(const char* configFile, const BridgeBroker* brokerP)
 //
 static void iotajsonClose(void)
 {
-  iotajsonExecutorClose();
+  iotajsonExecutorClose();                            // first: its threads hand measures over
+  iotajsonMeasuresClose();
 }
 
 
 
 // -----------------------------------------------------------------------------
 //
-// The Channels - measures are not built yet: every Channel is refused, saying so
+// The DataChannels - the measures' endpoints. A broker of ABI 15 says which channel type an endpoint is
+// (channelTypedAdd); an older one hands every channel over alike (channelAddInfo), and each is taken as a
+// DataChannel - a Channel configured for this bridge then receives records it cannot use.
 //
 static int iotajsonChannelAddInfo(const char* endpoint, BridgeChannelKind kind, BridgeDirection direction, const char* info)
 {
   (void) kind;
-  (void) direction;
   (void) info;
 
-  COR_W("iotajson: Channel '%s' refused - this bridge executes commands (Service Execution); measures are not built yet", endpoint);
+  if (direction != BridgeDirectionIn)
+  {
+    COR_W("iotajson: '%s' refused - a measure's DataChannel is inbound only", endpoint);
+    return BRIDGE_UNSUPPORTED;
+  }
+
+  int r = iotajsonMeasureEndpointAdd(endpoint);
+
+  if (r == BRIDGE_BAD_INPUT)
+    COR_W("iotajson: DataChannel '%s' refused - its endpoint is <apikey> or <apikey>/<deviceId>", endpoint);
+
+  return r;
+}
+
+#if BRIDGE_ABI_VERSION >= 15
+static int iotajsonChannelTypedAdd(const char* endpoint, BridgeChannelType type, BridgeChannelKind kind, BridgeDirection direction, const char* info)
+{
+  if (type == BridgeChannelTypeDataChannel)
+    return iotajsonChannelAddInfo(endpoint, kind, direction, info);
+
+  const char* reason = "the iotajson bridge carries DataChannels only - a device's command is a Service Execution";
+
+  if ((hostP != NULL) && (hostP->abiVersion >= 12) && (hostP->channelStatusIn != NULL))
+    hostP->channelStatusIn("iotajson", endpoint, BridgeChannelDormant, reason);
+
+  COR_W("iotajson: '%s' refused - %s", endpoint, reason);
   return BRIDGE_UNSUPPORTED;
 }
+#endif
 
 static int iotajsonChannelAdd(const char* endpoint, BridgeChannelKind kind, BridgeDirection direction)
 {
@@ -147,8 +187,7 @@ static int iotajsonChannelAdd(const char* endpoint, BridgeChannelKind kind, Brid
 
 static int iotajsonChannelDel(const char* endpoint)
 {
-  (void) endpoint;
-  return BRIDGE_NOT_FOUND;
+  return iotajsonMeasureEndpointDel(endpoint);
 }
 
 static int iotajsonPublish(const char* endpoint, const char* json)
@@ -180,6 +219,7 @@ static const char* iotajsonVersionInfo(void)
 //
 // A slot is filled only when the broker's abiVersion has it; abiVersion is then overwritten with this
 // plugin's. Service Execution is ABI 11: an older broker loads the plugin, and it executes nothing.
+// Which channel type an endpoint is, ABI 15: before it, every channel is taken as a DataChannel.
 //
 __attribute__((visibility("default"))) void bridgeRegister(BridgeDriver* driverP)
 {
@@ -205,6 +245,11 @@ __attribute__((visibility("default"))) void bridgeRegister(BridgeDriver* driverP
     driverP->serviceExecute = iotajsonServiceExecute;
     driverP->serviceCancel  = iotajsonServiceCancel;
   }
+
+#if BRIDGE_ABI_VERSION >= 15
+  if (driverP->abiVersion >= 15)
+    driverP->channelTypedAdd = iotajsonChannelTypedAdd;
+#endif
 
   driverP->abiVersion  = BRIDGE_ABI_VERSION;
 }

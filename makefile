@@ -53,7 +53,7 @@ endif
 #
 LIBS          = -lpthread -lmosquitto -lmicrohttpd
 
-SOURCES       = src/iotajsonRegister.c src/iotajsonExecutor.c src/iotajsonSouth.c
+SOURCES       = src/iotajsonRegister.c src/iotajsonExecutor.c src/iotajsonSouth.c src/iotajsonMeasures.c
 OBJS          = $(SOURCES:.c=.o)
 DEPS          = $(SOURCES:.c=.d)
 

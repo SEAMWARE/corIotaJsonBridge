@@ -22,7 +22,8 @@
 #include <stdbool.h>                                  // bool
 #include <stdio.h>                                    // snprintf
 #include <stdlib.h>                                   // malloc, realloc, free
-#include <string.h>                                   // strlen, strcmp, memcpy
+#include <string.h>                                   // strlen, strcmp, strncmp, memcpy
+#include <strings.h>                                  // strncasecmp
 
 #include <microhttpd.h>                               // MHD_*
 
@@ -31,6 +32,7 @@
 #include "corBridge/BridgeBroker.h"                   // BRIDGE_*
 
 #include "iotajsonExecutor.h"                         // iotajsonPullDeliver, iotajsonCommandResult
+#include "iotajsonMeasures.h"                         // iotajsonMeasure, IotaPayload
 #include "iotajsonSouth.h"                            // Own interface
 
 
@@ -86,10 +88,39 @@ static enum MHD_Result reply(struct MHD_Connection* connection, unsigned int sta
 //
 static enum MHD_Result error(struct MHD_Connection* connection, unsigned int status, const char* name, const char* message)
 {
-  char body[512];
+  char body[2048];
 
   snprintf(body, sizeof(body), "{\"name\":\"%s\",\"message\":\"%s\"}", name, message);
   return reply(connection, status, body);
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// jsonEscape - a message as a JSON string's content: it names what a device sent
+//
+static const char* jsonEscape(const char* in, char* out, int size)
+{
+  int at = 0;
+
+  for (; (*in != 0) && (at < size - 7); in++)
+  {
+    unsigned char c = (unsigned char) *in;
+
+    if ((c == '"') || (c == '\\'))
+    {
+      out[at++] = '\\';
+      out[at++] = c;
+    }
+    else if (c < 0x20)
+      at += snprintf(&out[at], size - at, "\\u%04x", c);
+    else
+      out[at++] = c;
+  }
+
+  out[at] = 0;
+  return out;
 }
 
 
@@ -100,15 +131,19 @@ static enum MHD_Result error(struct MHD_Connection* connection, unsigned int sta
 //
 static enum MHD_Result serve(struct MHD_Connection* connection, const char* url, const char* method, Upload* upP)
 {
-  bool commands = (strcmp(url, "/iot/json/commands") == 0);
+  bool        commands = (strcmp(url, "/iot/json/commands") == 0);
+  const char* attrName = (strncmp(url, "/iot/json/attrs/", 16) == 0) ? &url[16] : NULL;
 
-  if ((strcmp(url, "/iot/json") != 0) && (commands == false))
+  if ((attrName != NULL) && ((attrName[0] == 0) || (strchr(attrName, '/') != NULL)))
+    return error(connection, MHD_HTTP_NOT_FOUND, "NOT_FOUND", "no such resource");
+
+  if ((strcmp(url, "/iot/json") != 0) && (commands == false) && (attrName == NULL))
     return error(connection, MHD_HTTP_NOT_FOUND, "NOT_FOUND", "no such resource");
 
   bool get  = (strcmp(method, MHD_HTTP_METHOD_GET)  == 0);
   bool post = (strcmp(method, MHD_HTTP_METHOD_POST) == 0);
 
-  if (((get == false) && (post == false)) || ((commands == true) && (post == false)))
+  if (((get == false) && (post == false)) || ((commands == true || attrName != NULL) && (post == false)))
     return error(connection, MHD_HTTP_NOT_FOUND, "NOT_FOUND", "no such resource");
 
   if (upP->tooBig == true)
@@ -150,10 +185,33 @@ static enum MHD_Result serve(struct MHD_Connection* connection, const char* url,
     if (upP->len > 0)
       iotajsonCommandResult(apikey, deviceId, upP->buf, (int) upP->len);
   }
-  else if ((d != NULL) || (post == true))
+  else if (((get == true) && (d != NULL)) || ((post == true) && ((upP->len > 0) || (attrName != NULL))))
   {
-    COR_W("iotajson: a measure from %s/%s - measures are not built", apikey, deviceId);
-    return error(connection, MHD_HTTP_NOT_IMPLEMENTED, "NOT_IMPLEMENTED", "measures are not supported");
+    //
+    // A measure - in d= (GET), the body (POST), or one attribute's value (POST .../attrs/<name>), its
+    // Content-Type saying what the value is
+    //
+    const char*  body    = (get == true) ? d : ((upP->buf != NULL) ? upP->buf : "");
+    int          len     = (get == true) ? (int) strlen(d) : (int) upP->len;
+    const char*  t       = MHD_lookup_connection_value(connection, MHD_GET_ARGUMENT_KIND, "t");
+    const char*  type    = MHD_lookup_connection_value(connection, MHD_HEADER_KIND, MHD_HTTP_HEADER_CONTENT_TYPE);
+    IotaPayload  payload = IotaPayloadJson;
+    const char*  name    = NULL;
+    char         message[512];
+    char         escaped[1024];
+
+    if ((type != NULL) && (strncasecmp(type, "text/plain", 10) == 0))
+      payload = IotaPayloadText;
+    else if ((type != NULL) && (strncasecmp(type, "application/octet-stream", 24) == 0))
+      payload = IotaPayloadBinary;
+
+    int status = iotajsonMeasure(apikey, deviceId, body, len, attrName, payload, t, &name, message, sizeof(message));
+
+    if (status != 200)
+    {
+      COR_W("iotajson: a measure from %s/%s refused - %s: %s", apikey, deviceId, name, message);
+      return error(connection, status, name, jsonEscape(message, escaped, sizeof(escaped)));
+    }
   }
 
   if (pull == false)
