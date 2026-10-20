@@ -16,8 +16,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-// The southbound port - see header. libmicrohttpd parses HTTP; here only the routes: what iotagent-json's
-// HTTP binding answers (lib/bindings/HTTPBinding.js), its errors {"name", "message"} included.
+// The southbound port - see header. The broker serves it (BridgeBroker.httpListen, ABI 16); here only the
+// routes: what iotagent-json's HTTP binding answers (lib/bindings/HTTPBinding.js), its errors
+// {"name", "message"} included.
 //
 #include <stdbool.h>                                  // bool
 #include <stdio.h>                                    // snprintf
@@ -25,11 +26,9 @@
 #include <string.h>                                   // strlen, strcmp, strncmp, memcpy
 #include <strings.h>                                  // strncasecmp
 
-#include <microhttpd.h>                               // MHD_*
-
 #include "corLog/corLog.h"                            // COR_E, COR_W, COR_V
 
-#include "corBridge/BridgeBroker.h"                   // BRIDGE_*
+#include "corBridge/BridgeBroker.h"                   // BridgeBroker, BridgeHttpRequest, BRIDGE_*
 
 #include "iotajsonExecutor.h"                         // iotajsonPullDeliver, iotajsonCommandResult
 #include "iotajsonMeasures.h"                         // iotajsonMeasure, IotaPayload
@@ -37,47 +36,14 @@
 
 
 
-//
-// A body's limit: iotagent-json's expressLimit default, 1 MB
-//
-#define BODY_MAX  (1024 * 1024)
-
-
-
 // -----------------------------------------------------------------------------
 //
-// Upload - a request's body, read in parts
+// reply - a status and a JSON body, for the broker to send
 //
-typedef struct Upload
+static int reply(char** bodyP, int status, const char* json)
 {
-  char*   buf;
-  size_t  len;
-  bool    tooBig;
-} Upload;
-
-
-
-static struct MHD_Daemon* daemonP = NULL;
-
-
-
-// -----------------------------------------------------------------------------
-//
-// reply - a status and a JSON body
-//
-static enum MHD_Result reply(struct MHD_Connection* connection, unsigned int status, const char* json)
-{
-  struct MHD_Response* responseP = MHD_create_response_from_buffer(strlen(json), (void*) json, MHD_RESPMEM_MUST_COPY);
-
-  if (responseP == NULL)
-    return MHD_NO;
-
-  MHD_add_response_header(responseP, MHD_HTTP_HEADER_CONTENT_TYPE, "application/json");
-
-  enum MHD_Result r = MHD_queue_response(connection, status, responseP);
-
-  MHD_destroy_response(responseP);
-  return r;
+  *bodyP = strdup(json);
+  return (*bodyP != NULL) ? status : 500;
 }
 
 
@@ -86,12 +52,12 @@ static enum MHD_Result reply(struct MHD_Connection* connection, unsigned int sta
 //
 // error - iotagent-json's error body: {"name": "<NAME>", "message": "<message>"}
 //
-static enum MHD_Result error(struct MHD_Connection* connection, unsigned int status, const char* name, const char* message)
+static int error(char** bodyP, int status, const char* name, const char* message)
 {
   char body[2048];
 
   snprintf(body, sizeof(body), "{\"name\":\"%s\",\"message\":\"%s\"}", name, message);
-  return reply(connection, status, body);
+  return reply(bodyP, status, body);
 }
 
 
@@ -127,32 +93,37 @@ static const char* jsonEscape(const char* in, char* out, int size)
 
 // -----------------------------------------------------------------------------
 //
-// serve - a request, its body read
+// serve - a request on the southbound port (BridgeHttpHandler)
 //
-static enum MHD_Result serve(struct MHD_Connection* connection, const char* url, const char* method, Upload* upP)
+static int serve(const BridgeHttpRequest* reqP, char** bodyP, const char** contentTypeP)
 {
+  const char* url    = reqP->path;
+  const char* method = reqP->method;
+
+  *contentTypeP = "application/json";
+
   bool        commands = (strcmp(url, "/iot/json/commands") == 0);
   const char* attrName = (strncmp(url, "/iot/json/attrs/", 16) == 0) ? &url[16] : NULL;
 
   if ((attrName != NULL) && ((attrName[0] == 0) || (strchr(attrName, '/') != NULL)))
-    return error(connection, MHD_HTTP_NOT_FOUND, "NOT_FOUND", "no such resource");
+    return error(bodyP, 404, "NOT_FOUND", "no such resource");
 
   if ((strcmp(url, "/iot/json") != 0) && (commands == false) && (attrName == NULL))
-    return error(connection, MHD_HTTP_NOT_FOUND, "NOT_FOUND", "no such resource");
+    return error(bodyP, 404, "NOT_FOUND", "no such resource");
 
-  bool get  = (strcmp(method, MHD_HTTP_METHOD_GET)  == 0);
-  bool post = (strcmp(method, MHD_HTTP_METHOD_POST) == 0);
+  bool get  = (strcmp(method, "GET")  == 0);
+  bool post = (strcmp(method, "POST") == 0);
 
   if (((get == false) && (post == false)) || ((commands == true || attrName != NULL) && (post == false)))
-    return error(connection, MHD_HTTP_NOT_FOUND, "NOT_FOUND", "no such resource");
+    return error(bodyP, 404, "NOT_FOUND", "no such resource");
 
-  if (upP->tooBig == true)
-    return error(connection, MHD_HTTP_CONTENT_TOO_LARGE, "PAYLOAD_TOO_LARGE", "request entity too large");
+  if (reqP->bodyTooBig != 0)
+    return error(bodyP, 413, "PAYLOAD_TOO_LARGE", "request entity too large");
 
-  const char* apikey   = MHD_lookup_connection_value(connection, MHD_GET_ARGUMENT_KIND, "k");
-  const char* deviceId = MHD_lookup_connection_value(connection, MHD_GET_ARGUMENT_KIND, "i");
-  const char* getCmd   = MHD_lookup_connection_value(connection, MHD_GET_ARGUMENT_KIND, "getCmd");
-  const char* d        = MHD_lookup_connection_value(connection, MHD_GET_ARGUMENT_KIND, "d");
+  const char* apikey   = reqP->param(reqP, "k");
+  const char* deviceId = reqP->param(reqP, "i");
+  const char* getCmd   = reqP->param(reqP, "getCmd");
+  const char* d        = reqP->param(reqP, "d");
   bool        pull     = ((getCmd != NULL) && (strcmp(getCmd, "1") == 0));
 
   //
@@ -174,7 +145,7 @@ static enum MHD_Result serve(struct MHD_Connection* connection, const char* url,
     char message[256];
 
     snprintf(message, sizeof(message), "Some of the mandatory params weren't found in the request: [%s]", missing);
-    return error(connection, MHD_HTTP_BAD_REQUEST, "MANDATORY_PARAMS_NOT_FOUND", message);
+    return error(bodyP, 400, "MANDATORY_PARAMS_NOT_FOUND", message);
   }
 
   //
@@ -182,19 +153,19 @@ static enum MHD_Result serve(struct MHD_Connection* connection, const char* url,
   //
   if (commands == true)
   {
-    if (upP->len > 0)
-      iotajsonCommandResult(apikey, deviceId, upP->buf, (int) upP->len);
+    if (reqP->bodyLen > 0)
+      iotajsonCommandResult(apikey, deviceId, reqP->body, reqP->bodyLen);
   }
-  else if (((get == true) && (d != NULL)) || ((post == true) && ((upP->len > 0) || (attrName != NULL))))
+  else if (((get == true) && (d != NULL)) || ((post == true) && ((reqP->bodyLen > 0) || (attrName != NULL))))
   {
     //
     // A measure - in d= (GET), the body (POST), or one attribute's value (POST .../attrs/<name>), its
     // Content-Type saying what the value is
     //
-    const char*  body    = (get == true) ? d : ((upP->buf != NULL) ? upP->buf : "");
-    int          len     = (get == true) ? (int) strlen(d) : (int) upP->len;
-    const char*  t       = MHD_lookup_connection_value(connection, MHD_GET_ARGUMENT_KIND, "t");
-    const char*  type    = MHD_lookup_connection_value(connection, MHD_HEADER_KIND, MHD_HTTP_HEADER_CONTENT_TYPE);
+    const char*  body    = (get == true) ? d : reqP->body;
+    int          len     = (get == true) ? (int) strlen(d) : reqP->bodyLen;
+    const char*  t       = reqP->param(reqP, "t");
+    const char*  type    = reqP->header(reqP, "Content-Type");
     IotaPayload  payload = IotaPayloadJson;
     const char*  name    = NULL;
     char         message[512];
@@ -210,103 +181,22 @@ static enum MHD_Result serve(struct MHD_Connection* connection, const char* url,
     if (status != 200)
     {
       COR_W("iotajson: a measure from %s/%s refused - %s: %s", apikey, deviceId, name, message);
-      return error(connection, status, name, jsonEscape(message, escaped, sizeof(escaped)));
+      return error(bodyP, status, name, jsonEscape(message, escaped, sizeof(escaped)));
     }
   }
 
   if (pull == false)
-    return reply(connection, MHD_HTTP_OK, "{}");
+    return reply(bodyP, 200, "{}");
 
   char* body = iotajsonPullDeliver(apikey, deviceId);
 
   if (body == NULL)
-    return error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", "out of memory");
+    return error(bodyP, 500, "INTERNAL_ERROR", "out of memory");
 
   COR_V("iotajson: %s/%s asked for its commands: %s", apikey, deviceId, body);
 
-  enum MHD_Result r = reply(connection, MHD_HTTP_OK, body);
-
-  free(body);
-  return r;
-}
-
-
-
-// -----------------------------------------------------------------------------
-//
-// answer - MHD's access handler: called first with no body (a new request), then once per part of the
-// body, then with none left - the request served
-//
-static enum MHD_Result answer
-(
-  void*                   cls,
-  struct MHD_Connection*  connection,
-  const char*             url,
-  const char*             method,
-  const char*             version,
-  const char*             uploadData,
-  size_t*                 uploadDataSize,
-  void**                  conClsP
-)
-{
-  (void) cls;
-  (void) version;
-
-  Upload* upP = *conClsP;
-
-  if (upP == NULL)
-  {
-    if ((upP = calloc(1, sizeof(Upload))) == NULL)
-      return MHD_NO;
-
-    *conClsP = upP;
-    return MHD_YES;
-  }
-
-  if (*uploadDataSize > 0)
-  {
-    if ((upP->tooBig == false) && (upP->len + *uploadDataSize <= BODY_MAX))
-    {
-      char* bufP = realloc(upP->buf, upP->len + *uploadDataSize + 1);
-
-      if (bufP == NULL)
-        return MHD_NO;
-
-      memcpy(&bufP[upP->len], uploadData, *uploadDataSize);
-      upP->buf          = bufP;
-      upP->len         += *uploadDataSize;
-      upP->buf[upP->len] = 0;
-    }
-    else
-      upP->tooBig = true;
-
-    *uploadDataSize = 0;
-    return MHD_YES;
-  }
-
-  return serve(connection, url, method, upP);
-}
-
-
-
-// -----------------------------------------------------------------------------
-//
-// completed - a request's end, served or not: its body freed
-//
-static void completed(void* cls, struct MHD_Connection* connection, void** conClsP, enum MHD_RequestTerminationCode toe)
-{
-  (void) cls;
-  (void) connection;
-  (void) toe;
-
-  Upload* upP = *conClsP;
-
-  if (upP != NULL)
-  {
-    free(upP->buf);
-    free(upP);
-    *conClsP = NULL;
-  }
+  *bodyP = body;                                      // malloc'd - the broker frees it
+  return 200;
 }
 
 
@@ -315,16 +205,15 @@ static void completed(void* cls, struct MHD_Connection* connection, void** conCl
 //
 // iotajsonSouthOpen -
 //
-int iotajsonSouthOpen(unsigned short port)
+int iotajsonSouthOpen(unsigned short port, const BridgeBroker* brokerP)
 {
-  daemonP = MHD_start_daemon(MHD_USE_INTERNAL_POLLING_THREAD | MHD_USE_DUAL_STACK | MHD_USE_ERROR_LOG,
-                             port, NULL, NULL,
-                             answer, NULL,
-                             MHD_OPTION_NOTIFY_COMPLETED, completed, NULL,
-                             MHD_OPTION_CONNECTION_TIMEOUT, (unsigned int) 30,
-                             MHD_OPTION_END);
+  if ((brokerP->abiVersion < 16) || (brokerP->httpListen == NULL))
+  {
+    COR_E("iotajson: the southbound port %u needs a broker that serves it (bridge ABI 16, httpListen)", port);
+    return BRIDGE_ERR;
+  }
 
-  if (daemonP == NULL)
+  if (brokerP->httpListen("iotajson", port, serve) != BRIDGE_OK)
   {
     COR_E("iotajson: cannot listen on the southbound port %u", port);
     return BRIDGE_ERR;
@@ -332,19 +221,4 @@ int iotajsonSouthOpen(unsigned short port)
 
   COR_V("iotajson: the southbound port %u", port);
   return BRIDGE_OK;
-}
-
-
-
-// -----------------------------------------------------------------------------
-//
-// iotajsonSouthClose -
-//
-void iotajsonSouthClose(void)
-{
-  if (daemonP != NULL)
-  {
-    MHD_stop_daemon(daemonP);
-    daemonP = NULL;
-  }
 }

@@ -50,7 +50,7 @@
 
 #include "corBridge/BridgeBroker.h"                   // BridgeBroker, BRIDGE_*
 
-#include "iotajsonSouth.h"                            // iotajsonSouthOpen, iotajsonSouthClose
+#include "iotajsonSouth.h"                            // iotajsonSouthOpen
 #include "iotajsonMeasures.h"                         // iotajsonMeasure
 #include "iotajsonExecutor.h"                         // Own interface
 
@@ -1029,7 +1029,7 @@ int iotajsonExecutorOpen(CorNode* serverP, CorNode* southP, const BridgeBroker* 
       return BRIDGE_ERR;
     }
 
-    if (iotajsonSouthOpen((unsigned short) portP->value.i) != BRIDGE_OK)
+    if (iotajsonSouthOpen((unsigned short) portP->value.i, brokerP) != BRIDGE_OK)
       return BRIDGE_ERR;
     southUp = true;
   }
@@ -1053,12 +1053,6 @@ int iotajsonExecutorOpen(CorNode* serverP, CorNode* southP, const BridgeBroker* 
 //
 void iotajsonExecutorClose(void)
 {
-  if (southUp == true)
-  {
-    iotajsonSouthClose();                             // no request in flight after it
-    southUp = false;
-  }
-
   if (workerUp == true)
   {
     pthread_mutex_lock(&jobMutex);
