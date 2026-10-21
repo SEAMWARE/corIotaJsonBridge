@@ -82,7 +82,8 @@ iotagent-json's 7896. Without the server no MQTT commands, without the port no p
 { "iotajson": { "server": { "uri": "mqtt://mosquitto:1883" }, "southbound": { "port": 7896 } } }
 ```
 
-The southbound port is a libmicrohttpd daemon of the plugin's own, plain HTTP on every address, with no
+The southbound port is served by the broker for the plugin (bridge ABI 16, `httpListen` - a broker
+without it does not start when a port is configured), plain HTTP on every address, with no
 NGSI-LD and no authentication: a device names itself with `k` and `i`, as it does to iotagent-json. Its
 errors are iotagent-json's, `{"name": ..., "message": ...}`.
 
@@ -93,6 +94,6 @@ configuration file), lazy attributes, JEXL expressions, explicitAttrs, MQTT TLS 
 
 ## Build and test
 
-    make && make test          # libmosquitto-dev, libmicrohttpd; the tests run mosquitto and python3-paho-mqtt
+    make && make test          # libmosquitto-dev; the tests run mosquitto and python3-paho-mqtt
 
 `test/funcTests/device.py` plays the devices, over a private mosquitto on port 11884.

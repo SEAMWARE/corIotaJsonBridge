@@ -49,9 +49,10 @@ endif
 #
 # The broker is linked rdynamic, so corLog, corAlloc, corJson and corTree resolve from the running
 # process at dlopen - a plugin is built against the headers of the broker it is loaded into. Only the
-# transports' own libraries are linked here: libmosquitto (MQTT) and libmicrohttpd (the southbound port).
+# transport's own library is linked here: libmosquitto (MQTT). The southbound port is the broker's
+# (BridgeBroker.httpListen, bridge ABI 16).
 #
-LIBS          = -lpthread -lmosquitto -lmicrohttpd
+LIBS          = -lpthread -lmosquitto
 
 SOURCES       = src/iotajsonRegister.c src/iotajsonExecutor.c src/iotajsonSouth.c src/iotajsonMeasures.c
 OBJS          = $(SOURCES:.c=.o)
