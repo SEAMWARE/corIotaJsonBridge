@@ -51,6 +51,7 @@
 #include "corBridge/BridgeBroker.h"                   // BridgeBroker, BRIDGE_*
 
 #include "iotajsonSouth.h"                            // iotajsonSouthOpen, iotajsonSouthClose
+#include "iotajsonMeasures.h"                         // iotajsonMeasure
 #include "iotajsonExecutor.h"                         // Own interface
 
 
@@ -843,7 +844,11 @@ char* iotajsonPullDeliver(const char* apikey, const char* deviceId)
 
 // -----------------------------------------------------------------------------
 //
-// onMessage - libmosquitto's thread: [/][json/]<apikey>/<deviceId>/cmdexe
+// onMessage - libmosquitto's thread: [/][json/]<apikey>/<deviceId>/cmdexe, a command's answer, and
+// [/][json/]<apikey>/<deviceId>/attrs[/<attribute>], a measure
+//
+// json/<a>/<b>/attrs is the "json" level's multi-measure, not a single measure of the device <b>/attrs:
+// iotagent-json reads it so too.
 //
 static void onMessage(struct mosquitto* m, void* userdata, const struct mosquitto_message* msgP)
 {
@@ -851,13 +856,13 @@ static void onMessage(struct mosquitto* m, void* userdata, const struct mosquitt
   (void) userdata;
 
   const char* s = msgP->topic;
-  char        level[4][256];
+  char        level[5][256];
   int         levels = 0;
 
   if (*s == '/')
     s++;
 
-  while ((*s != 0) && (levels < 4))
+  while ((*s != 0) && (levels < 5))
   {
     const char* next = segment(s, level[levels], sizeof(level[0]));
 
@@ -867,12 +872,25 @@ static void onMessage(struct mosquitto* m, void* userdata, const struct mosquitt
     s = (*next == '/') ? next + 1 : next;
   }
 
-  int first = ((levels == 4) && (strcasecmp(level[0], "json") == 0)) ? 1 : 0;
-
-  if ((levels - first != 3) || (*s != 0) || (strcmp(level[first + 2], "cmdexe") != 0))
+  if (*s != 0)
     return;
 
-  cmdexe(level[first], level[first + 1], (const char*) msgP->payload, msgP->payloadlen);
+  int first = ((levels >= 4) && (strcasecmp(level[0], "json") == 0) && ((levels == 5) || (strcmp(level[3], "cmdexe") == 0) || (strcmp(level[3], "attrs") == 0))) ? 1 : 0;
+  int rest  = levels - first;                         // <apikey>/<deviceId>/<what>[/<attribute>]
+
+  if ((rest == 3) && (strcmp(level[first + 2], "cmdexe") == 0))
+    cmdexe(level[first], level[first + 1], (const char*) msgP->payload, msgP->payloadlen);
+  else if (((rest == 3) || (rest == 4)) && (strcmp(level[first + 2], "attrs") == 0))
+  {
+    const char* name    = NULL;
+    char        message[512];
+    const char* attrName = (rest == 4) ? level[first + 3] : NULL;
+    int         status  = iotajsonMeasure(level[first], level[first + 1], (const char*) msgP->payload, msgP->payloadlen,
+                                          attrName, IotaPayloadJson, NULL, &name, message, sizeof(message));
+
+    if (status != 200)
+      COR_W("iotajson: measure on '%s' dropped - %s: %s", msgP->topic, name, message);
+  }
 }
 
 
@@ -899,6 +917,16 @@ static void onConnect(struct mosquitto* m, void* userdata, int rc)
   mosquitto_subscribe(m, NULL, "/+/+/cmdexe",     1);
   mosquitto_subscribe(m, NULL, "/json/+/+/cmdexe", 1);
   mosquitto_subscribe(m, NULL, "json/+/+/cmdexe",  1);
+
+  //
+  // ... and its measures: all at once, and one attribute at a time
+  //
+  mosquitto_subscribe(m, NULL, "/+/+/attrs",        1);
+  mosquitto_subscribe(m, NULL, "/+/+/attrs/+",      1);
+  mosquitto_subscribe(m, NULL, "/json/+/+/attrs",   1);
+  mosquitto_subscribe(m, NULL, "/json/+/+/attrs/+", 1);
+  mosquitto_subscribe(m, NULL, "json/+/+/attrs",    1);
+  mosquitto_subscribe(m, NULL, "json/+/+/attrs/+",  1);
 
   COR_V("iotajson: connected to %s", serverDesc);
 }

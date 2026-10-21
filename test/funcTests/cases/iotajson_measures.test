@@ -1,0 +1,318 @@
+#
+# FILE            iotajson_measures.test
+#
+# Copyright 2026 Seamware
+# SPDX-License-Identifier: Apache-2.0
+#
+# Measures as DataChannel records (coraine doc/iot-agent-measures.md): a device's measure is a record - its
+# keys, plus @deviceId and @apikey, TimeInstant taken out as its time - handed to the broker on the device's
+# DataChannel (<apikey>/<deviceId>), else its group's (<apikey>); the DataChannel's mapping makes the entity.
+#
+#   th-key/th1   a device's own DataChannel: 't' as temperature (a number), the bridge's otherColumns
+#                "property" - every other key an attribute
+#   grp-key      a group's: the entity id from @deviceId, the scope /garden
+#
+# On the southbound port, as iotagent-json's: POST /iot/json, GET /iot/json?d=, POST /iot/json/attrs/<name>
+# (JSON, text/plain, application/octet-stream as hex), a multi-measure array in TimeInstant order, and the
+# errors - DEVICE_GROUP_NOT_FOUND, DEVICE_NOT_FOUND, a body that is no measure. Over MQTT, the same two
+# topics, [/][json/]<apikey>/<deviceId>/attrs[/<name>]. A Channel configured for this bridge is refused.
+#
+--NAME--
+iotajson - measures as DataChannel records, over HTTP and MQTT
+
+--TAGS--
+iotajson measures
+
+--INIT--
+rm -rf "${IOTAJSON_TEST_DIR:?}"
+mkdir -p "$IOTAJSON_TEST_DIR"
+printf 'listener 11884\nallow_anonymous true\n' > "$IOTAJSON_TEST_DIR/mosquitto.conf"
+nohup mosquitto -c "$IOTAJSON_TEST_DIR/mosquitto.conf" > "$IOTAJSON_TEST_DIR/mosquitto.log" 2>&1 &
+echo $! > "$IOTAJSON_TEST_DIR/mosquitto.pid"
+for i in $(seq 1 50); do (echo > /dev/tcp/localhost/11884) 2>/dev/null && break; sleep 0.1; done
+cat > "$IOTAJSON_TEST_DIR/bridges.json" <<EOF
+{
+  "iotajson": {
+    "server":     { "uri": "mqtt://localhost:11884" },
+    "southbound": { "port": 17897 },
+    "ngsild": {
+      "defaultEntity": false,
+      "otherColumns": "property",
+      "topics": { "lamp-key/lamp1": { "entityId": "urn:ngsi-ld:Lamp:lamp1", "entityType": "Lamp", "attribute": "on" } },
+      "dataChannels": {
+        "th-key/th1": { "entities": [ { "type": "Thermometer", "id": "urn:ngsi-ld:Thermometer:th1",
+                                        "attributes": { "temperature": { "column": "t", "as": "number", "unitCode": "CEL" } } } ] },
+        "grp-key":    { "entities": [ { "type": "Sensor", "id": "urn:ngsi-ld:Sensor:{@deviceId}", "scope": "/garden",
+                                        "attributes": { "temperature": { "column": "t", "as": "number" } } } ] }
+      }
+    }
+  }
+}
+EOF
+brokerStart
+
+--RUN--
+B="http://localhost:$IOTAJSON_PORT/ngsi-ld/v1"
+S="http://localhost:17897"
+
+south() {  # south <curl args> - the body and the status
+  curl -s -w "\n%{http_code}\n" "$@"
+}
+entity() {  # entity <id> - the entity, its attributes' observedAt included
+  curl -s "$B/entities/$1"
+  echo
+}
+mqttPub() {  # mqttPub <topic> <payload>
+  python3 -c "
+import sys, paho.mqtt.publish as p
+p.single(sys.argv[1], sys.argv[2], qos=1, hostname='localhost', port=11884)" "$1" "$2"
+}
+await() {  # await <id> <text> - until the entity's body has the text (5 s)
+  local i
+  for i in $(seq 1 50); do curl -s "$B/entities/$1" | grep -q -- "$2" && return 0; sleep 0.1; done
+  echo "await: $1 never had $2"
+}
+
+echo "01. POST /iot/json - th1's own DataChannel: 't' its temperature, 'h' an other column; TimeInstant its observedAt"
+echo "================================================================================================================"
+south "$S/iot/json?k=th-key&i=th1" -H 'Content-Type: application/json' -d '{"t": "21.5", "h": 40, "TimeInstant": "2026-10-20T21:00:00.000Z"}'
+entity urn:ngsi-ld:Thermometer:th1
+echo
+echo
+
+
+echo "02. A multi-measure array - one record each, in TimeInstant order: the latest (first in the array) stays"
+echo "========================================================================================================"
+south "$S/iot/json?k=th-key&i=th1" -H 'Content-Type: application/json' \
+      -d '[{"t": 30, "TimeInstant": "2026-10-20T21:10:00.000Z"}, {"t": 25, "TimeInstant": "2026-10-20T21:05:00.000Z"}]'
+entity urn:ngsi-ld:Thermometer:th1
+echo
+echo
+
+
+echo "03. GET /iot/json?d= - and the 't' parameter as the time when the measure has none"
+echo "==================================================================================="
+south "$S/iot/json?k=th-key&i=th1&t=2026-10-20T22:00:00.000Z&d=%7B%22t%22%3A18%7D"
+entity urn:ngsi-ld:Thermometer:th1
+echo
+echo
+
+
+echo "04. POST /iot/json/attrs/<name> - JSON, text/plain, application/octet-stream (hex)"
+echo "=================================================================================="
+south "$S/iot/json/attrs/t?k=th-key&i=th1&t=2026-10-20T22:01:00.000Z"    -H 'Content-Type: application/json'         -d '17'
+south "$S/iot/json/attrs/note?k=th-key&i=th1&t=2026-10-20T22:01:00.000Z" -H 'Content-Type: text/plain'               -d 'all fine'
+south "$S/iot/json/attrs/raw?k=th-key&i=th1&t=2026-10-20T22:01:00.000Z"  -H 'Content-Type: application/octet-stream' -d 'AB'
+entity urn:ngsi-ld:Thermometer:th1
+echo
+echo
+
+
+echo "05. A group's DataChannel - two devices of grp-key, each its own entity"
+echo "========================================================================"
+south "$S/iot/json?k=grp-key&i=s1&t=2026-10-20T22:02:00.000Z" -H 'Content-Type: application/json' -d '{"t": 10}'
+south "$S/iot/json?k=grp-key&i=s2&t=2026-10-20T22:02:00.000Z" -H 'Content-Type: application/json' -d '{"t": 11}'
+entity urn:ngsi-ld:Sensor:s1
+entity urn:ngsi-ld:Sensor:s2
+echo
+echo
+
+
+echo "06. The errors - no group, a group's devices but not this one, no measure, not JSON"
+echo "==================================================================================="
+south "$S/iot/json?k=nokey&i=x"     -H 'Content-Type: application/json' -d '{"t": 1}'
+south "$S/iot/json?k=th-key&i=th9"  -H 'Content-Type: application/json' -d '{"t": 1}'
+south "$S/iot/json?k=th-key&i=th1"  -H 'Content-Type: application/json' -d '42'
+south "$S/iot/json?k=th-key&i=th1"  -H 'Content-Type: application/json' -d '{"t":'
+echo
+echo
+
+
+echo "07. MQTT - /<apikey>/<deviceId>/attrs, json/<apikey>/<deviceId>/attrs/<name>"
+echo "============================================================================="
+mqttPub /th-key/th1/attrs '{"t": 5, "TimeInstant": "2026-10-20T23:00:00.000Z"}'
+await urn:ngsi-ld:Thermometer:th1 '"value": 5'
+mqttPub json/grp-key/s3/attrs/t '7'
+await urn:ngsi-ld:Sensor:s3 '"value": 7'
+curl -s "$B/entities/urn:ngsi-ld:Thermometer:th1?pick=temperature" | grep -E '"value"|observedAt'
+curl -s "$B/entities/urn:ngsi-ld:Sensor:s3?pick=temperature,scope" | grep -E '"value"|scope'
+echo
+echo
+
+
+echo "08. The Channel on lamp-key/lamp1 - refused: the bridge carries DataChannels only"
+echo "================================================================================="
+grep -c "carries DataChannels only" "$IOTAJSON_TEST_DIR/broker.log"
+echo
+echo
+
+
+--TEARDOWN--
+brokerStop
+for f in mosquitto; do
+  [ -f "$IOTAJSON_TEST_DIR/$f.pid" ] || continue
+  pid=$(cat "$IOTAJSON_TEST_DIR/$f.pid")
+  kill "$pid" 2>/dev/null
+  for i in $(seq 1 50); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+done
+true
+
+
+--EXPECT--
+01. POST /iot/json - th1's own DataChannel: 't' its temperature, 'h' an other column; TimeInstant its observedAt
+================================================================================================================
+{}
+200
+{
+  "id": "urn:ngsi-ld:Thermometer:th1",
+  "type": "Thermometer",
+  "temperature": {
+    "type": "Property",
+    "value": 21.5,
+    "unitCode": "CEL",
+    "observedAt": "2026-10-20T21:00:00Z"
+  },
+  "h": {
+    "type": "Property",
+    "value": 40,
+    "observedAt": "2026-10-20T21:00:00Z"
+  }
+}
+
+
+
+02. A multi-measure array - one record each, in TimeInstant order: the latest (first in the array) stays
+========================================================================================================
+{}
+200
+{
+  "id": "urn:ngsi-ld:Thermometer:th1",
+  "type": "Thermometer",
+  "temperature": {
+    "type": "Property",
+    "value": 30,
+    "unitCode": "CEL",
+    "observedAt": "2026-10-20T21:10:00Z"
+  },
+  "h": {
+    "type": "Property",
+    "value": 40,
+    "observedAt": "2026-10-20T21:00:00Z"
+  }
+}
+
+
+
+03. GET /iot/json?d= - and the 't' parameter as the time when the measure has none
+===================================================================================
+{}
+200
+{
+  "id": "urn:ngsi-ld:Thermometer:th1",
+  "type": "Thermometer",
+  "temperature": {
+    "type": "Property",
+    "value": 18,
+    "unitCode": "CEL",
+    "observedAt": "2026-10-20T22:00:00Z"
+  },
+  "h": {
+    "type": "Property",
+    "value": 40,
+    "observedAt": "2026-10-20T21:00:00Z"
+  }
+}
+
+
+
+04. POST /iot/json/attrs/<name> - JSON, text/plain, application/octet-stream (hex)
+==================================================================================
+{}
+200
+{}
+200
+{}
+200
+{
+  "id": "urn:ngsi-ld:Thermometer:th1",
+  "type": "Thermometer",
+  "temperature": {
+    "type": "Property",
+    "value": 17,
+    "unitCode": "CEL",
+    "observedAt": "2026-10-20T22:01:00Z"
+  },
+  "h": {
+    "type": "Property",
+    "value": 40,
+    "observedAt": "2026-10-20T21:00:00Z"
+  },
+  "note": {
+    "type": "Property",
+    "value": "all fine",
+    "observedAt": "2026-10-20T22:01:00Z"
+  },
+  "raw": {
+    "type": "Property",
+    "value": "4142",
+    "observedAt": "2026-10-20T22:01:00Z"
+  }
+}
+
+
+
+05. A group's DataChannel - two devices of grp-key, each its own entity
+========================================================================
+{}
+200
+{}
+200
+{
+  "id": "urn:ngsi-ld:Sensor:s1",
+  "type": "Sensor",
+  "scope": "/garden",
+  "temperature": {
+    "type": "Property",
+    "value": 10,
+    "observedAt": "2026-10-20T22:02:00Z"
+  }
+}
+
+{
+  "id": "urn:ngsi-ld:Sensor:s2",
+  "type": "Sensor",
+  "scope": "/garden",
+  "temperature": {
+    "type": "Property",
+    "value": 11,
+    "observedAt": "2026-10-20T22:02:00Z"
+  }
+}
+
+
+
+06. The errors - no group, a group's devices but not this one, no measure, not JSON
+===================================================================================
+{"name":"DEVICE_GROUP_NOT_FOUND","message":"Couldn't find device group for apikey nokey"}
+404
+{"name":"DEVICE_NOT_FOUND","message":"No device was found with id:th9 and apikey th-key"}
+404
+{"name":"BAD_PAYLOAD","message":"a measure is a JSON object, or an array of them"}
+400
+{"name":"BAD_PAYLOAD","message":"a measure is a JSON object, or an array of them"}
+400
+
+
+07. MQTT - /<apikey>/<deviceId>/attrs, json/<apikey>/<deviceId>/attrs/<name>
+=============================================================================
+    "value": 5,
+    "observedAt": "2026-10-20T23:00:00Z"
+  "scope": "/garden",
+    "value": 7,
+
+
+08. The Channel on lamp-key/lamp1 - refused: the bridge carries DataChannels only
+=================================================================================
+2
+
+
